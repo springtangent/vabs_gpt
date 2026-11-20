@@ -24,8 +24,8 @@ import time
 from dataclasses import asdict, fields
 
 from .gpu import ComputeContext
-from .model import (Config, Device, Model, Runner, activation_bytes, param_counts,
-                    param_layout, sample)
+from .model import (Config, Device, Model, Muon, Runner, activation_bytes, model_bytes,
+                    optimizer_bytes, param_counts, sample)
 
 HERE = os.path.dirname(__file__)
 DEFAULT_OUT = os.path.join(HERE, 'model.bin')
@@ -127,10 +127,23 @@ def device_local_bytes(ctx):
                 if heap.flags & vk.MemoryHeapFlags.DEVICE_LOCAL), default=0)
 
 
+def muon_options(args):
+    """The ``Muon`` options of a run, or None for AdamW alone."""
+    if args.optimizer == 'adamw':
+        return None
+    return Muon(momentum=args.muon_momentum, ns_steps=args.muon_ns_steps, scale=args.muon_scale)
+
+
+def optimizer_family(name):
+    """Optimizers whose saved moments mean the same thing (muonclip keeps Muon's state)."""
+    return 'muon' if name in ('muon', 'muonclip') else name
+
+
 def device_bytes_needed(cfg, args):
-    n_params = sum(size for _, size in param_layout(cfg))
+    muon = muon_options(args)
     return (activation_bytes(cfg, args.batch, 'train') + activation_bytes(cfg, args.batch, 'eval')
-            + 5 * 4 * n_params)
+            + optimizer_bytes(cfg, args.batch, muon, args.qk_clip or 0.0, args.optim_bits)
+            + model_bytes(cfg, args.optim_bits, muon is not None))
 
 
 def summary(cfg, args, train_bytes):
@@ -149,6 +162,16 @@ def summary(cfg, args, train_bytes):
     print(f'  lr {args.lr:g} -> {args.min_lr:g} ({args.schedule}, warmup {args.warmup}), '
           f'betas ({args.beta1}, {args.beta2}), eps {args.eps:g}, weight decay '
           f'{args.weight_decay:g}, grad clip {args.grad_clip:g}')
+    opt = 'AdamW'
+    if args.optimizer != 'adamw':
+        opt = (f'{"MuonClip" if args.qk_clip else "Muon"} on the hidden matrices (momentum '
+               f'{args.muon_momentum}, {args.muon_ns_steps} Newton-Schulz steps, scale '
+               f'{args.muon_scale:g}), AdamW on the rest')
+    if args.qk_clip:
+        opt += f', QK-Clip tau {args.qk_clip:g}'
+    if args.optim_bits == 8:
+        opt += ', 8-bit blockwise states (bitsandbytes)'
+    print(f'  optimizer: {opt}')
     print(f'  device memory needed: ~{device_bytes_needed(cfg, args) / 2 ** 20:,.0f} MB')
 
 
@@ -178,6 +201,8 @@ def train(args):
                          f'--out for a new file, or --resume {args.out} to continue it')
     if args.min_lr is None:
         args.min_lr = args.lr * 0.1
+    if args.qk_clip is None:
+        args.qk_clip = 100.0 if args.optimizer == 'muonclip' else 0.0
     train_path = os.path.join(args.data, 'train.bin')
     train_bytes = os.path.getsize(train_path) if os.path.exists(train_path) else 0
     if args.epochs:
@@ -199,14 +224,26 @@ def train(args):
             raise SystemExit(f'needs ~{need / 2 ** 30:.2f} GB of device memory; reduce --batch '
                              '(use --grad-accum for the same tokens per step) or --ctx')
         dev = Device(ctx)
+        optim_args = {'optim_bits': args.optim_bits, 'muon': args.optimizer != 'adamw'}
         if resume:
-            header, params, m, v = resume
-            model = Model(dev, cfg, params, m=m, v=v, step=header.get('step', 0))
-            print(f'resumed {args.resume} at step {model.step}'
-                  + ('' if m is not None else ' (no optimizer state: Adam moments restart)'))
+            header, params, state = resume
+            note = '' if state is not None else ' (no optimizer state: the moments restart)'
+            saved = header.get('train', {}).get('optimizer', 'adamw')
+            bits = header.get('optim_bits', 32)
+            if state is not None and optimizer_family(saved) != optimizer_family(args.optimizer):
+                state = None   # Muon's momentum is not an Adam moment and the other way round
+                note = f' (switching from {saved} to {args.optimizer}: the moments restart)'
+            elif state is not None and bits != args.optim_bits:
+                state = None
+                note = (f' (switching from {bits}-bit to {args.optim_bits}-bit optimizer '
+                        'states: the moments restart)')
+            model = Model(dev, cfg, params, step=header.get('step', 0), **(state or {}),
+                          **({} if state else optim_args))
+            print(f'resumed {args.resume} at step {model.step}{note}')
         else:
-            model = Model(dev, cfg, seed=args.seed)
-        runner = Runner(model, args.batch, 'train', accum=args.grad_accum)
+            model = Model(dev, cfg, seed=args.seed, **optim_args)
+        runner = Runner(model, args.batch, 'train', accum=args.grad_accum,
+                        muon=muon_options(args), qk_clip=args.qk_clip)
         evaluator = Runner(model, args.batch, 'eval')
         if args.epochs:
             train_data = Batches(train_path, args.batch, cfg.ctx, args.seed, 'epoch',
@@ -234,23 +271,40 @@ def train(args):
         start = model.step
         print(f'step {start}: val loss {evaluate():.4f}', flush=True)
         t0, losses, norms = time.perf_counter(), [], []
+
+        def record(result, step):
+            """Keep the (loss, grad norm) of a finished step; they arrive one step late."""
+            if result is None:
+                return
+            if not math.isfinite(result[0]):
+                raise SystemExit(f'step {step}: loss is {result[0]}; lower --lr or set '
+                                 '--grad-clip')
+            losses.append(result[0])
+            norms.append(result[1])
+
         try:
             while model.step < args.steps:
                 lr = lr_at(model.step, args)
-                loss, norm = runner.train_step(
+                # Queues this step and returns the one before, so the GPU stays busy
+                # while the next batch is prepared.
+                record(runner.submit_step(
                     [train_data.get() for _ in range(args.grad_accum)], lr, args.beta1,
-                    args.beta2, args.eps, args.weight_decay, args.grad_clip)
-                if not math.isfinite(loss):
-                    raise SystemExit(f'step {model.step}: loss is {loss}; lower --lr or set '
-                                     '--grad-clip')
-                losses.append(loss)
-                norms.append(norm)
+                    args.beta2, args.eps, args.weight_decay, args.grad_clip), model.step - 1)
                 step = model.step
+                if (step % args.log_every == 0 or step % args.eval_every == 0
+                        or step == args.steps
+                        or (args.sample_every and step % args.sample_every == 0)):
+                    record(runner.collect(), step)   # everything up to this step is done
                 if step % args.log_every == 0:
                     dt = time.perf_counter() - t0
                     done = step - start
+                    qk = ''
+                    if runner.max_logits:   # this step's, before its clip
+                        heads = [x for layer in runner.max_logits for x in layer]
+                        qk = (f'  max logit {max(heads):.1f} ('
+                              f'{sum(x > args.qk_clip for x in heads)} heads clipped)')
                     print(f'step {step:6d}  loss {sum(losses) / len(losses):.4f}  '
-                          f'grad norm {sum(norms) / len(norms):.3f}  lr {lr:.2e}  '
+                          f'grad norm {sum(norms) / len(norms):.3f}  lr {lr:.2e}{qk}  '
                           f'{dt / done * 1000:.0f} ms/step  {tokens * done / dt:,.0f} tok/s',
                           flush=True)
                     losses, norms = [], []
@@ -262,6 +316,7 @@ def train(args):
                 if args.sample_every and step % args.sample_every == 0:
                     show_sample()
         except KeyboardInterrupt:
+            runner.collect()
             val = evaluate()
             save(val)
             print(f'\ninterrupted at step {model.step}; saved {args.out} (val loss {val:.4f}); '
@@ -313,11 +368,11 @@ def evaluate_checkpoint(args):
 
 
 def info(args):
-    header, params, m, _ = Model.read(args.checkpoint)
+    header, params, state = Model.read(args.checkpoint)
     cfg = Config(**header['config'])
+    kind = 'no' if state is None else f'{header.get("optim_bits", 32)}-bit'
     print(f'{args.checkpoint}: {len(params):,} parameters, step {header.get("step")}, '
-          f'val loss {header.get("val_loss", float("nan")):.4f}, '
-          f'optimizer state {"yes" if m is not None else "no"}')
+          f'val loss {header.get("val_loss", float("nan")):.4f}, optimizer state {kind}')
     print(json.dumps({'config': asdict(cfg), 'train': header.get('train', {})}, indent=2))
 
 
@@ -359,6 +414,22 @@ def build_parser():
     g.add_argument('--weight-decay', type=float, default=0.0,
                    help='AdamW decay on matrices and embeddings (not biases/norms)')
     g.add_argument('--grad-clip', type=float, default=0.0, help='max global grad norm (0: off)')
+    g.add_argument('--optimizer', choices=('adamw', 'muon', 'muonclip'), default='adamw',
+                   help='muon: Muon on the hidden matrices (q, k, v, attention output, MLP), '
+                        'AdamW with the same lr and decay on the rest; muonclip: muon plus '
+                        'QK-Clip')
+    g.add_argument('--optim-bits', type=int, choices=(32, 8), default=32,
+                   help='8: keep the AdamW moments and Muon momentum as 8-bit blockwise '
+                        'states (bitsandbytes), a quarter of the float32 memory')
+    g.add_argument('--muon-momentum', type=float, default=0.95, help='Muon Nesterov momentum')
+    g.add_argument('--muon-ns-steps', type=int, default=5, help='Newton-Schulz iterations')
+    g.add_argument('--muon-scale', type=float, default=0.2,
+                   help='Muon update = scale * sqrt(max(rows, cols)) * orthogonalized momentum, '
+                        'which matches the update RMS of AdamW')
+    g.add_argument('--qk-clip', type=float, default=None,
+                   help='QK-Clip tau: after each step, rescale the q and k weights of every head '
+                        'whose largest attention logit exceeded it (default: 100 with muonclip, '
+                        'else off; 0: off)')
     g.add_argument('--seed', type=int, default=0, help='init and data-order seed')
 
     g = t.add_argument_group('data, logging and checkpoints')
@@ -437,6 +508,10 @@ def parse_args(argv=None):
     if args.lr <= 0 or args.warmup < 0 or args.weight_decay < 0 or args.grad_clip < 0:
         raise SystemExit('--lr must be positive; --warmup, --weight-decay and --grad-clip '
                          'non-negative')
+    if (args.qk_clip or 0) < 0 or args.muon_ns_steps < 1 or not 0 <= args.muon_momentum < 1 \
+            or args.muon_scale <= 0:
+        raise SystemExit('--qk-clip must be non-negative, --muon-ns-steps at least 1, '
+                         '--muon-momentum in [0, 1) and --muon-scale positive')
     if not args.resume:
         try:
             model_config(args)

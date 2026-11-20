@@ -149,6 +149,8 @@ class Recording:
     """A command buffer recorded once through a vabs ``Frame``, submitted repeatedly.
 
     ``with rec.record() as frame:`` records; ``rec.submit()`` runs and waits.
+    ``rec.start()`` and ``rec.wait()`` do the two halves separately, so the host
+    can queue the next recording while this one runs.
     """
 
     def __init__(self, ctx):
@@ -174,6 +176,17 @@ class Recording:
 
     def submit(self):
         submit_and_wait(self._ctx, self._cmd, self._fence)
+
+    def start(self):
+        """Submit without waiting; ``wait()`` must follow before the next submission."""
+        vk.queue_submit2(self._ctx.queue, [vk.SubmitInfo2(command_buffer_infos=[
+            vk.CommandBufferSubmitInfo(command_buffer=self._cmd, device_mask=0)])], self._fence)
+
+    def wait(self):
+        """Block until the submission made by ``start()`` has finished."""
+        vk.wait_for_fences(self._ctx.device, [self._fence], wait_all=True,
+                           timeout=0xFFFFFFFFFFFFFFFF)
+        vk.reset_fences(self._ctx.device, [self._fence])
 
     def destroy(self):
         if self._fence is not None:
