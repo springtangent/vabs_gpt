@@ -14,6 +14,7 @@ inputs (tokens, learning rate) change between submissions.
 import cvk
 import vk
 from vabs import _native, memory_stats
+from vabs.shader_features import enable_shader_features, query_shader_features
 from vabs.renderer import Frame
 
 
@@ -34,6 +35,9 @@ class ComputeContext:
                     engine_version=1, api_version=cvk.API_VERSION_1_3),
                 enabled_layer_names=[], enabled_extension_names=[]))
             self._pick_physical_device()
+            # bfloat16, cooperative matrices and 16-bit storage when the device has them
+            self.shader_features = query_shader_features(self.physical_device)
+            extensions, chain = enable_shader_features(self.shader_features)
             features = vk.PhysicalDeviceFeatures2(
                 features=_native.feature_struct(vk.PhysicalDeviceFeatures, shader_int64=True))
             f12 = _native.feature_struct(vk.PhysicalDeviceVulkan12Features,
@@ -41,10 +45,10 @@ class ComputeContext:
             f13 = _native.feature_struct(vk.PhysicalDeviceVulkan13Features,
                                          synchronization2=True, maintenance4=True)
             self.device = vk.create_device(self.physical_device, vk.DeviceCreateInfo(
-                p_next=_native.pnext_chain(features, f13, f12),
+                p_next=_native.pnext_chain(features, f13, f12, *chain),
                 queue_create_infos=[vk.DeviceQueueCreateInfo(
                     queue_family_index=self.queue_family_index, queue_priorities=[1.0])],
-                enabled_extension_names=[]))
+                enabled_extension_names=extensions))
             self.queue = vk.get_device_queue(self.device, self.queue_family_index, 0)
             self.command_pool = vk.create_command_pool(self.device, vk.CommandPoolCreateInfo(
                 flags=vk.CommandPoolCreateFlags.RESET_COMMAND_BUFFER,
@@ -74,6 +78,15 @@ class ComputeContext:
         name = best[3]
         self.device_name = (name.decode(errors='replace') if isinstance(name, bytes)
                             else str(name)).rstrip('\0')
+
+    @property
+    def supports_bf16_matmul(self):
+        """Whether the bfloat16 cooperative-matrix kernels (16 x 16 x 16) can run."""
+        from vabs.structs import bfloat16, float32
+        f = self.shader_features
+        return (f.bfloat16 and f.storage_buffer_16bit and f.bfloat16_cooperative_matrix
+                and f.subgroup_size == 32
+                and f.supports_coopmat(bfloat16, bfloat16, float32, 16, 16, 16))
 
     def find_memory_type(self, type_bits, properties):
         for i in range(len(self.mem_props.memory_types)):
